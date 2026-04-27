@@ -72,6 +72,17 @@ class DatasetConfig(BaseModel):
             raise ValueError("Either 'path' or 'name' must be set.")
         if self.path is not None and self.name is not None:
             raise ValueError("Cannot set both 'path' and 'name'.")
+        if self.name is not None:
+            dataset_type = "Package" if self.is_package() else "Registry"
+            raise ValueError(
+                f"{dataset_type} datasets are disabled in this build. "
+                "Use a local dataset 'path' instead."
+            )
+        if self.registry_url is not None or self.registry_path is not None:
+            raise ValueError(
+                "Registry datasets are disabled in this build. "
+                "Use a local dataset 'path' instead."
+            )
         if self.version is not None and self.ref is not None:
             raise ValueError("Cannot set both 'version' and 'ref'.")
         return self
@@ -150,65 +161,16 @@ class DatasetConfig(BaseModel):
         ]
 
     async def _get_registry_task_configs(self) -> list[TaskConfig]:
-        from pier.registry.client import RegistryClientFactory
-
-        assert self.name is not None
-        client = RegistryClientFactory.create(
-            registry_url=self.registry_url,
-            registry_path=self.registry_path,
+        raise ValueError(
+            "Registry datasets are disabled in this build. "
+            "Use a local dataset 'path' instead."
         )
 
-        name_string = f"{self.name}@{self.version}" if self.version else self.name
-        metadata = await client.get_dataset_metadata(name_string)
-
-        result: list[TaskConfig] = []
-        for task_id in self._filter_task_ids(metadata.task_ids):
-            match task_id:
-                case GitTaskId():
-                    result.append(
-                        TaskConfig(
-                            path=task_id.path,
-                            git_url=task_id.git_url,
-                            git_commit_id=task_id.git_commit_id,
-                            overwrite=self.overwrite,
-                            download_dir=self.download_dir,
-                            source=self.name,
-                        )
-                    )
-                case LocalTaskId():
-                    result.append(
-                        TaskConfig(
-                            path=task_id.path,
-                            overwrite=self.overwrite,
-                            download_dir=self.download_dir,
-                            source=self.name,
-                        )
-                    )
-        return result
-
     async def _get_package_task_configs(self) -> list[TaskConfig]:
-        from pier.registry.client.package import PackageDatasetClient
-
-        assert self.name is not None
-        client = PackageDatasetClient()
-
-        name_string = f"{self.name}@{self.ref or 'latest'}"
-        metadata = await client.get_dataset_metadata(name_string)
-
-        # Update ref to be the content hash for config version tracking
-        self.ref = metadata.version
-
-        return [
-            TaskConfig(
-                name=f"{task_id.org}/{task_id.name}",
-                ref=task_id.ref,
-                overwrite=self.overwrite,
-                download_dir=self.download_dir,
-                source=self.name,
-            )
-            for task_id in self._filter_task_ids(metadata.task_ids)
-            if isinstance(task_id, PackageTaskId)
-        ]
+        raise ValueError(
+            "Package datasets are disabled in this build. "
+            "Use a local dataset 'path' instead."
+        )
 
 
 class RetryConfig(BaseModel):
