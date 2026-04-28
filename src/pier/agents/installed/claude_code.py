@@ -1,10 +1,19 @@
 import json
 import os
 import shlex
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from pier.agents.backends import (
+    AgentBackend,
+    BackendContext,
+    backend_registry,
+    collect_env,
+    require_env,
+    strip_model_namespace,
+)
 from pier.agents.installed.base import (
     BaseInstalledAgent,
     CliFlag,
@@ -14,8 +23,8 @@ from pier.agents.installed.base import (
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
 from pier.models.agent.install import AgentInstallSpec, InstallStep
-from pier.models.agent.network import NetworkAllowlist
 from pier.models.agent.name import AgentName
+from pier.models.agent.network import NetworkAllowlist
 from pier.models.trajectories import (
     Agent,
     FinalMetrics,
@@ -29,8 +38,220 @@ from pier.models.trajectories import (
 from pier.models.trial.paths import EnvironmentPaths
 
 
+class ClaudeCodeBackend(AgentBackend):
+    """Shared surface for Claude Code backends.
+
+    Beyond the universal :class:`AgentBackend` hooks, Claude Code backends
+    may need to drop files into the sandbox before ``claude`` runs. The
+    :meth:`prepare_environment` hook exists for that and is called between
+    the setup command and the main ``claude`` invocation.
+    """
+
+    async def prepare_environment(
+        self,
+        ctx: BackendContext,
+        environment: BaseEnvironment,
+    ) -> None:
+        """Backend-specific file uploads or sandbox setup. Default: no-op.
+
+        Runs after the agent's base setup command but before ``claude``.
+        """
+        return None
+
+
+class ClaudeCodeAnthropicBackend(ClaudeCodeBackend):
+    """Claude Code talking to api.anthropic.com directly."""
+
+    name = "anthropic"
+
+    _PASS_ENV = (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+    )
+    _AUTH_ALTERNATIVES = (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    )
+
+    def validate(self, ctx: BackendContext) -> None:
+        if ctx.model_name:
+            strip_model_namespace(ctx.model_name, "anthropic")
+        require_env(
+            backend_label=f"{ctx.agent_name} backend {self.name!r}",
+            get_env=ctx.get_env,
+            any_of=(self._AUTH_ALTERNATIVES,),
+        )
+
+    def build_env(self, ctx: BackendContext) -> dict[str, str]:
+        return collect_env(ctx.get_env, self._PASS_ENV)
+
+    def runtime_model_name(self, ctx: BackendContext) -> str | None:
+        if ctx.runtime_model_name:
+            return ctx.runtime_model_name
+        if not ctx.model_name:
+            return None
+        # Respect a user-supplied custom base URL that uses full provider-
+        # prefixed model ids (e.g. OpenRouter).
+        if ctx.get_env("ANTHROPIC_BASE_URL"):
+            return ctx.model_name
+        return strip_model_namespace(ctx.model_name, "anthropic")
+
+    def allowlist_for_base_url(self, ctx: BackendContext) -> NetworkAllowlist | None:
+        """If the user set ``ANTHROPIC_BASE_URL``, trust that host instead."""
+        base_url = ctx.get_env("ANTHROPIC_BASE_URL")
+        if not base_url:
+            return None
+        parsed = urlparse(base_url if "://" in base_url else f"https://{base_url}")
+        if not parsed.hostname:
+            return None
+        return NetworkAllowlist(domains=[parsed.hostname])
+
+    def network_allowlist(self) -> NetworkAllowlist:
+        return NetworkAllowlist(domains=["api.anthropic.com"])
+
+
+class ClaudeCodeRespanBackend(ClaudeCodeBackend):
+    """Claude Code talking to Anthropic-compatible endpoints through Respan."""
+
+    name = "respan"
+
+    _BASE_URL = "https://endpoint.respan.ai/api/anthropic/"
+
+    def validate(self, ctx: BackendContext) -> None:
+        if ctx.model_name:
+            strip_model_namespace(ctx.model_name, "anthropic")
+        require_env(
+            backend_label=f"{ctx.agent_name} backend {self.name!r}",
+            get_env=ctx.get_env,
+            any_of=(("RESPAN_API_KEY",),),
+        )
+        # Claude Code prefers ANTHROPIC_AUTH_TOKEN over ANTHROPIC_API_KEY when
+        # both are set, which would silently route around Respan.
+        if ctx.get_env("ANTHROPIC_AUTH_TOKEN"):
+            raise ValueError(
+                f"{ctx.agent_name} backend {self.name!r} cannot be used with "
+                "ANTHROPIC_AUTH_TOKEN set; unset it or use a different backend."
+            )
+
+    def build_env(self, ctx: BackendContext) -> dict[str, str]:
+        env: dict[str, str] = {"ANTHROPIC_BASE_URL": self._BASE_URL}
+        respan_key = ctx.get_env("RESPAN_API_KEY")
+        if respan_key:
+            env["ANTHROPIC_API_KEY"] = respan_key
+        return env
+
+    def runtime_model_name(self, ctx: BackendContext) -> str | None:
+        if ctx.runtime_model_name:
+            return ctx.runtime_model_name
+        if not ctx.model_name:
+            return None
+        return strip_model_namespace(ctx.model_name, "anthropic")
+
+    def network_allowlist(self) -> NetworkAllowlist:
+        return NetworkAllowlist(domains=["endpoint.respan.ai"])
+
+
+class ClaudeCodeVertexBackend(ClaudeCodeBackend):
+    """Claude Code talking to Anthropic-on-Vertex (Google Cloud)."""
+
+    name = "vertex_ai"
+
+    #: Remote path where we drop ``GCP_SERVICE_ACCOUNT_JSON`` if the user
+    #: supplied it inline. Single source of truth for this path.
+    _REMOTE_SA_JSON_PATH = "/tmp/claude-code-gcp-sa.json"
+
+    def _vertex_project_id(self, ctx: BackendContext) -> str | None:
+        project = ctx.get_env("ANTHROPIC_VERTEX_PROJECT_ID") or ctx.get_env(
+            "GOOGLE_CLOUD_PROJECT"
+        )
+        if project:
+            return project
+        sa_json = ctx.get_env("GCP_SERVICE_ACCOUNT_JSON")
+        if not sa_json:
+            return None
+        try:
+            return json.loads(sa_json).get("project_id")
+        except json.JSONDecodeError:
+            return None
+
+    def validate(self, ctx: BackendContext) -> None:
+        if ctx.model_name:
+            strip_model_namespace(ctx.model_name, "anthropic")
+        require_env(
+            backend_label=f"{ctx.agent_name} backend {self.name!r}",
+            get_env=ctx.get_env,
+            any_of=(("GCP_SERVICE_ACCOUNT_JSON", "GOOGLE_APPLICATION_CREDENTIALS"),),
+        )
+        if not self._vertex_project_id(ctx):
+            raise ValueError(
+                f"{ctx.agent_name} backend {self.name!r} requires a project id via "
+                "ANTHROPIC_VERTEX_PROJECT_ID, GOOGLE_CLOUD_PROJECT, or a "
+                "project_id field in GCP_SERVICE_ACCOUNT_JSON"
+            )
+
+    def build_env(self, ctx: BackendContext) -> dict[str, str]:
+        env: dict[str, str] = {
+            "CLAUDE_CODE_USE_VERTEX": "1",
+            "CLOUD_ML_REGION": (
+                ctx.get_env("CLOUD_ML_REGION")
+                or ctx.get_env("GOOGLE_CLOUD_LOCATION")
+                or "global"
+            ),
+        }
+        if project_id := self._vertex_project_id(ctx):
+            env["ANTHROPIC_VERTEX_PROJECT_ID"] = project_id
+
+        # Prefer an explicit host credentials path (user is responsible for
+        # making it resolvable inside the sandbox). Otherwise, if an inline
+        # SA JSON was supplied, we'll upload it in ``prepare_environment``
+        # and point the agent at the remote path.
+        credentials_path = ctx.get_env("GOOGLE_APPLICATION_CREDENTIALS")
+        if credentials_path:
+            env["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
+        elif ctx.get_env("GCP_SERVICE_ACCOUNT_JSON"):
+            env["GOOGLE_APPLICATION_CREDENTIALS"] = self._REMOTE_SA_JSON_PATH
+        return env
+
+    def network_allowlist(self) -> NetworkAllowlist:
+        return NetworkAllowlist(domains=[".googleapis.com"])
+
+    async def prepare_environment(
+        self,
+        ctx: BackendContext,
+        environment: BaseEnvironment,
+    ) -> None:
+        # Only upload the inline JSON case; an explicit credentials path is
+        # the user's responsibility.
+        sa_json = ctx.get_env("GCP_SERVICE_ACCOUNT_JSON")
+        if not sa_json or ctx.get_env("GOOGLE_APPLICATION_CREDENTIALS"):
+            return
+
+        # Write to a host tempfile, upload via the environment transport,
+        # then delete. Keeps the secret out of shell-argv and logs.
+        fd, local_path_str = tempfile.mkstemp(prefix="pier-claude-gcp-sa-", suffix=".json")
+        local_path = Path(local_path_str)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(sa_json)
+            os.chmod(local_path, 0o600)
+            await environment.upload_file(local_path, self._REMOTE_SA_JSON_PATH)
+            await environment.exec(
+                command=f"chmod 600 {shlex.quote(self._REMOTE_SA_JSON_PATH)}",
+            )
+        finally:
+            local_path.unlink(missing_ok=True)
+
+
 class ClaudeCode(BaseInstalledAgent):
     SUPPORTS_ATIF: bool = True
+    DEFAULT_BACKEND = "anthropic"
+    BACKENDS = backend_registry(
+        ClaudeCodeAnthropicBackend(),
+        ClaudeCodeRespanBackend(),
+        ClaudeCodeVertexBackend(),
+    )
     memory_dir: str | None
 
     CLI_FLAGS = [
@@ -150,16 +371,14 @@ class ClaudeCode(BaseInstalledAgent):
         )
 
     def network_allowlist(self) -> NetworkAllowlist:
-        if self._is_bedrock_mode():
-            return NetworkAllowlist(domains=[".amazonaws.com"])
-
-        base_url = self._get_env("ANTHROPIC_BASE_URL")
-        if base_url:
-            parsed = urlparse(base_url if "://" in base_url else f"https://{base_url}")
-            if parsed.hostname:
-                return NetworkAllowlist(domains=[parsed.hostname])
-
-        return NetworkAllowlist(domains=["api.anthropic.com"])
+        # Anthropic backend honors a user-supplied custom base URL
+        # (OpenRouter, self-hosted); everything else defers to the backend.
+        backend = self.backend_spec()
+        if isinstance(backend, ClaudeCodeAnthropicBackend):
+            override = backend.allowlist_for_base_url(self.backend_context(self._get_env))
+            if override:
+                return override
+        return super().network_allowlist()
 
     def _get_session_dir(self) -> Path | None:
         """Identify the Claude session directory containing the primary JSONL log"""
@@ -1006,114 +1225,70 @@ class ClaudeCode(BaseInstalledAgent):
         escaped = shlex.quote(claude_json)
         return f"echo {escaped} > $CLAUDE_CONFIG_DIR/.claude.json"
 
-    @staticmethod
-    def _is_bedrock_mode() -> bool:
-        """Check if Bedrock mode is enabled via environment variables."""
-        if os.environ.get("CLAUDE_CODE_USE_BEDROCK", "").strip() == "1":
-            return True
-        if os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip():
-            return True
-        return False
+    def _claude_code_backend(self) -> ClaudeCodeBackend:
+        backend = self.require_backend_spec()
+        assert isinstance(backend, ClaudeCodeBackend), (
+            f"ClaudeCode backend {backend.name!r} must subclass ClaudeCodeBackend"
+        )
+        return backend
 
     @with_prompt_template
     async def run(
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
     ) -> None:
         escaped_instruction = shlex.quote(instruction)
+        backend = self._claude_code_backend()
+        ctx = self.backend_context(self._get_env)
 
-        use_bedrock = self._is_bedrock_mode()
-
-        env = {
-            "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY")
-            or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-            or "",
-            "ANTHROPIC_BASE_URL": os.environ.get("ANTHROPIC_BASE_URL", None),
-            "CLAUDE_CODE_OAUTH_TOKEN": os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", ""),
-            "CLAUDE_CODE_MAX_OUTPUT_TOKENS": os.environ.get(
-                "CLAUDE_CODE_MAX_OUTPUT_TOKENS", None
-            ),
+        process_env: dict[str, str] = {
             "FORCE_AUTO_BACKGROUND_TASKS": "1",
             "ENABLE_BACKGROUND_TASKS": "1",
+            # Disable non-essential traffic (telemetry, etc.)
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            # Allow bypassPermissions mode when running as root inside containers
+            "IS_SANDBOX": "1",
+            "CLAUDE_CONFIG_DIR": (EnvironmentPaths.agent_dir / "sessions").as_posix(),
         }
-
-        # Bedrock configuration: pass through AWS credentials and region
-        if use_bedrock:
-            env["CLAUDE_CODE_USE_BEDROCK"] = "1"
-
-            # AWS Bedrock API key auth (Option E from Bedrock docs)
-            bedrock_token = os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "")
-            if bedrock_token:
-                env["AWS_BEARER_TOKEN_BEDROCK"] = bedrock_token
-
-            # Standard AWS credential chain (Option B from Bedrock docs)
-            for aws_var in (
-                "AWS_ACCESS_KEY_ID",
-                "AWS_SECRET_ACCESS_KEY",
-                "AWS_SESSION_TOKEN",
-                "AWS_PROFILE",
-            ):
-                val = os.environ.get(aws_var, "")
-                if val:
-                    env[aws_var] = val
-
-            # AWS_REGION is required for Bedrock; default to us-east-1
-            env["AWS_REGION"] = os.environ.get("AWS_REGION", "us-east-1")
-
-            # Optional: separate region for the small/fast model (Haiku)
-            small_model_region = os.environ.get(
-                "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION", ""
+        process_env.update(
+            collect_env(
+                self._get_env,
+                (
+                    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                ),
             )
-            if small_model_region:
-                env["ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION"] = small_model_region
+        )
+        process_env.update(backend.build_env(ctx))
 
-            # Optional: disable prompt caching (not available in all regions)
-            if os.environ.get("DISABLE_PROMPT_CACHING", "").strip() == "1":
-                env["DISABLE_PROMPT_CACHING"] = "1"
+        # Drop empties so Claude CLI picks the best available auth method.
+        process_env = {k: v for k, v in process_env.items() if v}
 
-        # Remove empty auth credentials to allow Claude CLI to prioritize the available method
-        # When both are empty, Claude CLI will fail with a clear authentication error
-        env = {k: v for k, v in env.items() if v}
+        runtime_model_name = backend.runtime_model_name(ctx)
+        if runtime_model_name:
+            process_env["ANTHROPIC_MODEL"] = runtime_model_name
+        elif self._get_env("ANTHROPIC_MODEL"):
+            process_env["ANTHROPIC_MODEL"] = self._get_env("ANTHROPIC_MODEL") or ""
 
-        # Handle model name based on whether using custom API base or Bedrock
-        if self.model_name:
-            if use_bedrock:
-                # Bedrock model IDs (e.g. global.anthropic.claude-sonnet-4-5-20250929-v1:0)
-                # or ARNs should be passed through as-is; strip the provider prefix only
-                # when it looks like a Pier-style "provider/model" string
-                if "/" in self.model_name:
-                    env["ANTHROPIC_MODEL"] = self.model_name.split("/", 1)[-1]
-                else:
-                    env["ANTHROPIC_MODEL"] = self.model_name
-            elif "ANTHROPIC_BASE_URL" in env:
-                # If using custom base URL (OpenRouter, self-hosted), keep full model name
-                env["ANTHROPIC_MODEL"] = self.model_name
-            else:
-                # Strip provider prefix for official Anthropic API
-                env["ANTHROPIC_MODEL"] = self.model_name.split("/")[-1]
-        elif "ANTHROPIC_MODEL" in os.environ:
-            env["ANTHROPIC_MODEL"] = os.environ["ANTHROPIC_MODEL"]
+        # When pointed at a non-Anthropic base URL, force all model aliases
+        # (sonnet/opus/haiku + subagent) to the same model so Claude Code
+        # doesn't silently call the default model alias against the wrong host.
+        if "ANTHROPIC_BASE_URL" in process_env and "ANTHROPIC_MODEL" in process_env:
+            model = process_env["ANTHROPIC_MODEL"]
+            for alias in (
+                "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                "CLAUDE_CODE_SUBAGENT_MODEL",
+            ):
+                process_env[alias] = model
 
-        # When using custom base URL, set all model aliases to the same model
-        if "ANTHROPIC_BASE_URL" in env and "ANTHROPIC_MODEL" in env:
-            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = env["ANTHROPIC_MODEL"]
-            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = env["ANTHROPIC_MODEL"]
-            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = env["ANTHROPIC_MODEL"]
-            env["CLAUDE_CODE_SUBAGENT_MODEL"] = env["ANTHROPIC_MODEL"]
-
-        # Disable adaptive thinking if requested
-        if os.environ.get("CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING", "").strip() == "1":
-            env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
-
-        # Disable non-essential traffic (telemetry, etc.)
-        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
-
-        # Allow bypassPermissions mode when running as root inside containers
-        env["IS_SANDBOX"] = "1"
+        if (
+            self._get_env("CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING") or ""
+        ).strip() == "1":
+            process_env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
 
         # Merge declarative env vars (e.g. MAX_THINKING_TOKENS)
-        env.update(self._resolved_env_vars)
-
-        env["CLAUDE_CONFIG_DIR"] = (EnvironmentPaths.agent_dir / "sessions").as_posix()
+        process_env.update(self._resolved_env_vars)
 
         setup_command = (
             "mkdir -p $CLAUDE_CONFIG_DIR/debug $CLAUDE_CONFIG_DIR/projects/-app "
@@ -1142,8 +1317,12 @@ class ClaudeCode(BaseInstalledAgent):
         await self.exec_as_agent(
             environment,
             command=setup_command,
-            env=env,
+            env=process_env,
         )
+        # Backend-owned setup (e.g. Vertex SA JSON upload). Runs between the
+        # agent's own setup and the main ``claude`` invocation so ``claude``
+        # sees any files the backend drops into the sandbox.
+        await backend.prepare_environment(ctx, environment)
         await self.exec_as_agent(
             environment,
             command=(
@@ -1154,5 +1333,5 @@ class ClaudeCode(BaseInstalledAgent):
                 f"--print -- {escaped_instruction} 2>&1 </dev/null | tee "
                 f"/logs/agent/claude-code.txt"
             ),
-            env=env,
+            env=process_env,
         )

@@ -461,9 +461,39 @@ def start(
         Option(
             "-m",
             "--model",
-            help="Model name for the agent (can be used multiple times)",
+            help=(
+                "Pier model id in provider/model format, used for tracking and "
+                "backend compatibility (can be used multiple times). Example: "
+                "anthropic/claude-sonnet-4-5"
+            ),
             rich_help_panel="Agent",
             show_default=True,
+        ),
+    ] = None,
+    backend: Annotated[
+        str | None,
+        Option(
+            "--backend",
+            help=(
+                "Agent-specific inference backend (each agent declares its "
+                "own supported values). Rejected when the job config has "
+                "multiple agents unless --agent is also passed."
+            ),
+            rich_help_panel="Agent",
+            show_default=False,
+        ),
+    ] = None,
+    runtime_model_name: Annotated[
+        str | None,
+        Option(
+            "--runtime-model",
+            help=(
+                "Advanced: the exact model string to pass to the agent "
+                "runtime. Normally derived from --model and --backend; only "
+                "set this when the backend needs a different id shape."
+            ),
+            rich_help_panel="Agent",
+            show_default=False,
         ),
     ] = None,
     agent_kwargs: Annotated[
@@ -755,6 +785,8 @@ def start(
                     name=agent_name,
                     import_path=agent_import_path,
                     model_name=model_name,
+                    backend=backend,
+                    runtime_model_name=runtime_model_name,
                     kwargs=parsed_kwargs,
                     env=parsed_env,
                 )
@@ -765,6 +797,8 @@ def start(
                 AgentConfig(
                     name=agent_name,
                     import_path=agent_import_path,
+                    backend=backend,
+                    runtime_model_name=runtime_model_name,
                     kwargs=parsed_kwargs,
                     env=parsed_env,
                 )
@@ -772,12 +806,40 @@ def start(
     else:
         parsed_kwargs = parse_kwargs(agent_kwargs)
         parsed_env = parse_env_vars(agent_env)
-        if parsed_kwargs or parsed_env:
-            for agent in config.agents:
-                if parsed_kwargs:
-                    agent.kwargs.update(parsed_kwargs)
-                if parsed_env:
-                    agent.env.update(parsed_env)
+
+        # ``--backend`` and ``--runtime-model`` are agent-specific: applying
+        # one value across a heterogeneous multi-agent config clobbers
+        # per-agent settings (e.g. forcing ``respan`` onto both Claude Code
+        # and Codex when only one supports it). Reject the ambiguity and
+        # make the user either narrow to a single agent with ``--agent`` or
+        # edit the config file. ``--ak`` and ``--ae`` still broadcast,
+        # because shared kwargs/env across agents is a reasonable intent.
+        agent_specific_overrides = [
+            flag
+            for flag, present in (
+                ("--backend", backend is not None),
+                ("--runtime-model", runtime_model_name is not None),
+            )
+            if present
+        ]
+        if agent_specific_overrides and len(config.agents) != 1:
+            console.print(
+                f"[red]❌ {', '.join(agent_specific_overrides)} cannot be "
+                f"applied to a config with {len(config.agents)} agents. "
+                "Edit the config file directly, or pass --agent/"
+                "--agent-import-path to define a single-agent job.[/red]"
+            )
+            raise SystemExit(1)
+
+        for agent in config.agents:
+            if backend is not None:
+                agent.backend = backend
+            if runtime_model_name is not None:
+                agent.runtime_model_name = runtime_model_name
+            if parsed_kwargs:
+                agent.kwargs.update(parsed_kwargs)
+            if parsed_env:
+                agent.env.update(parsed_env)
 
     if environment_type is not None:
         config.environment.type = environment_type

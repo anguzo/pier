@@ -1,9 +1,16 @@
 import base64
 import json
-import os
 import shlex
 from typing import Any, Literal
 
+from pier.agents.backends import (
+    AgentBackend,
+    BackendContext,
+    backend_registry,
+    collect_env,
+    require_env,
+    strip_model_namespace,
+)
 from pier.agents.installed.base import (
     BaseInstalledAgent,
     CliFlag,
@@ -29,6 +36,105 @@ from pier.models.trajectories import (
 _ImageMediaType = Literal["image/jpeg", "image/png", "image/gif", "image/webp"]
 
 
+class GeminiCliBackend(AgentBackend):
+    """Backend base for the Gemini CLI agent.
+
+    Gemini backends mostly compose pass-through env vars and a fixed model
+    namespace. The base helper factors out the shared validation + runtime
+    model derivation; subclasses only declare their env shape.
+    """
+
+    _MODEL_NAMESPACE = "google"
+
+    def _validate_common(self, ctx: BackendContext) -> None:
+        if ctx.model_name:
+            strip_model_namespace(ctx.model_name, self._MODEL_NAMESPACE)
+
+    def runtime_model_name(self, ctx: BackendContext) -> str | None:
+        if ctx.runtime_model_name:
+            return ctx.runtime_model_name
+        if not ctx.model_name:
+            return None
+        return strip_model_namespace(ctx.model_name, self._MODEL_NAMESPACE)
+
+
+class GeminiCliGeminiBackend(GeminiCliBackend):
+    """Gemini CLI talking to Google AI Studio / generativelanguage.googleapis.com."""
+
+    name = "gemini"
+
+    _PASS_ENV = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_BASE_URL")
+
+    def validate(self, ctx: BackendContext) -> None:
+        self._validate_common(ctx)
+        require_env(
+            backend_label=f"{ctx.agent_name} backend {self.name!r}",
+            get_env=ctx.get_env,
+            any_of=(("GEMINI_API_KEY", "GOOGLE_API_KEY"),),
+        )
+
+    def build_env(self, ctx: BackendContext) -> dict[str, str]:
+        return collect_env(ctx.get_env, self._PASS_ENV)
+
+
+class GeminiCliVertexBackend(GeminiCliBackend):
+    """Gemini CLI talking to Vertex AI."""
+
+    name = "vertex_ai"
+
+    _PASS_ENV = (
+        "GEMINI_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_API_KEY",
+        "GOOGLE_VERTEX_BASE_URL",
+    )
+
+    def validate(self, ctx: BackendContext) -> None:
+        self._validate_common(ctx)
+        require_env(
+            backend_label=f"{ctx.agent_name} backend {self.name!r}",
+            get_env=ctx.get_env,
+            any_of=(
+                (
+                    "GOOGLE_APPLICATION_CREDENTIALS",
+                    "GOOGLE_API_KEY",
+                    "GEMINI_API_KEY",
+                ),
+            ),
+            all_of=("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION"),
+        )
+
+    def build_env(self, ctx: BackendContext) -> dict[str, str]:
+        env = {"GOOGLE_GENAI_USE_VERTEXAI": "true"}
+        env.update(collect_env(ctx.get_env, self._PASS_ENV))
+        return env
+
+
+class GeminiCliRespanBackend(GeminiCliBackend):
+    """Gemini CLI routed through the Respan gateway."""
+
+    name = "respan"
+
+    _BASE_URL = "https://endpoint.respan.ai/api/google/gemini"
+
+    def validate(self, ctx: BackendContext) -> None:
+        self._validate_common(ctx)
+        require_env(
+            backend_label=f"{ctx.agent_name} backend {self.name!r}",
+            get_env=ctx.get_env,
+            any_of=(("RESPAN_API_KEY",),),
+        )
+
+    def build_env(self, ctx: BackendContext) -> dict[str, str]:
+        env: dict[str, str] = {"GOOGLE_GEMINI_BASE_URL": self._BASE_URL}
+        respan_key = ctx.get_env("RESPAN_API_KEY")
+        if respan_key:
+            env["GEMINI_API_KEY"] = respan_key
+        return env
+
+
 class GeminiCli(BaseInstalledAgent):
     """
     The Gemini CLI agent uses Google's Gemini CLI tool to solve tasks.
@@ -38,6 +144,12 @@ class GeminiCli(BaseInstalledAgent):
         return ". ~/.nvm/nvm.sh; gemini --version"
 
     SUPPORTS_ATIF: bool = True
+    DEFAULT_BACKEND = "gemini"
+    BACKENDS = backend_registry(
+        GeminiCliGeminiBackend(),
+        GeminiCliVertexBackend(),
+        GeminiCliRespanBackend(),
+    )
 
     CLI_FLAGS = [
         CliFlag(
@@ -471,34 +583,26 @@ class GeminiCli(BaseInstalledAgent):
     ) -> None:
         escaped_instruction = shlex.quote(instruction)
 
-        if not self.model_name or "/" not in self.model_name:
-            raise ValueError("Model name must be in the format provider/model_name")
-
-        model = self.model_name.split("/")[-1]
+        backend = self.require_backend_spec()
+        ctx = self.backend_context(self._get_env)
+        model = backend.runtime_model_name(ctx)
+        if not model:
+            raise ValueError("Model name is required")
 
         # Gemini CLI refuses to honor `--yolo` in an untrusted workspace and
         # overrides approval mode back to "default"
-        env = {"GEMINI_CLI_TRUST_WORKSPACE": "true"}
-
-        auth_vars = [
-            "GEMINI_API_KEY",
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            "GOOGLE_CLOUD_PROJECT",
-            "GOOGLE_CLOUD_LOCATION",
-            "GOOGLE_GENAI_USE_VERTEXAI",
-            "GOOGLE_API_KEY",
-        ]
-        for var in auth_vars:
-            if var in os.environ:
-                env[var] = os.environ[var]
+        process_env: dict[str, str] = {"GEMINI_CLI_TRUST_WORKSPACE": "true"}
+        process_env.update(backend.build_env(ctx))
 
         skills_command = self._build_register_skills_command()
         if skills_command:
-            await self.exec_as_agent(environment, command=skills_command, env=env)
+            await self.exec_as_agent(
+                environment, command=skills_command, env=process_env
+            )
 
         mcp_command = self._build_register_mcp_servers_command()
         if mcp_command:
-            await self.exec_as_agent(environment, command=mcp_command, env=env)
+            await self.exec_as_agent(environment, command=mcp_command, env=process_env)
 
         cli_flags = self.build_cli_flags()
         extra_flags = (cli_flags + " ") if cli_flags else ""
@@ -511,7 +615,7 @@ class GeminiCli(BaseInstalledAgent):
                     f"gemini --yolo {extra_flags}--model={model} --prompt={escaped_instruction} "
                     f"2>&1 </dev/null | stdbuf -oL tee /logs/agent/gemini-cli.txt"
                 ),
-                env=env,
+                env=process_env,
             )
         finally:
             try:

@@ -52,6 +52,40 @@ Run a deterministic random subset of a local dataset:
 pier run -p path/to/dataset --n-tasks 10 --sample-seed 0
 ```
 
+### Agent Models And Backends
+
+Pier separates model identity from runtime wiring:
+
+- `--model` / `agent.model_name` is Pier's canonical model id, used for tracking and backend compatibility. Use `provider/model` format, such as `anthropic/claude-sonnet-4-5`, `openai/gpt-5.5`, or `google/gemini-2.5-pro`.
+- `--backend` / `agent.backend` selects the agent-specific inference integration. Each agent declares its own supported backends (valid values differ per agent):
+  - `claude-code`: `anthropic` (default), `respan`, `vertex_ai`
+  - `codex`: `openai` (default), `respan`
+  - `gemini-cli`: `gemini` (default), `vertex_ai`, `respan`
+  - `mini-swe-agent`: `native` (default; dispatches to LiteLLM)
+  - `opencode`: `native` (default; dispatches to the agent's own provider layer)
+- `--runtime-model` / `agent.runtime_model_name` is an advanced override for the exact model string passed to the agent runtime. Leave it unset unless the backend needs a different provider-specific model id.
+
+For example, Claude Code through Respan still records the canonical model as Anthropic Claude, while the backend maps credentials and endpoint details for Respan:
+
+```bash
+pier run -p path/to/task \
+  --agent claude-code \
+  --model anthropic/claude-sonnet-4-5 \
+  --backend respan
+```
+
+If a backend requires a runtime id Pier cannot derive, pass it explicitly:
+
+```bash
+pier run -p path/to/task \
+  --agent gemini-cli \
+  --model google/gemini-2.5-pro \
+  --backend vertex_ai \
+  --runtime-model gemini-2.5-pro
+```
+
+`--backend` and `--runtime-model` are agent-specific, so if your job config has multiple agents you must either edit the YAML directly or narrow the job with `--agent`.
+
 To use a Harbor registry dataset, download it with Harbor first. For example, from `~/code/harbor`:
 
 ```bash

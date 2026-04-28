@@ -1,10 +1,17 @@
 import copy
 import json
-import os
 import shlex
 from datetime import datetime, timezone
 from typing import Any
 
+from pier.agents.backends import (
+    AgentBackend,
+    BackendContext,
+    backend_registry,
+    collect_env,
+    require_env,
+    split_model_name,
+)
 from pier.agents.installed.base import (
     BaseInstalledAgent,
     CliFlag,
@@ -27,6 +34,96 @@ from pier.models.trajectories import (
 from pier.utils.trajectory_utils import format_trajectory_json
 
 
+#: OpenCode provider → alternative credential env vars. Any one of the names
+#: in each inner tuple must be set for the provider to authenticate.
+_OPENCODE_AUTH_ALTERNATIVES: dict[str, tuple[tuple[str, ...], ...]] = {
+    "anthropic": (("ANTHROPIC_API_KEY",),),
+    "azure": (("AZURE_RESOURCE_NAME",), ("AZURE_API_KEY",)),
+    "deepseek": (("DEEPSEEK_API_KEY",),),
+    "github-copilot": (("GITHUB_TOKEN",),),
+    "google": (
+        (
+            "GEMINI_API_KEY",
+            "GOOGLE_GENERATIVE_AI_API_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_API_KEY",
+        ),
+    ),
+    "groq": (("GROQ_API_KEY",),),
+    "huggingface": (("HF_TOKEN",),),
+    "llama": (("LLAMA_API_KEY",),),
+    "mistral": (("MISTRAL_API_KEY",),),
+    "openai": (("OPENAI_API_KEY",),),
+    "opencode": (("OPENCODE_API_KEY",),),
+    "xai": (("XAI_API_KEY",),),
+    "openrouter": (("OPENROUTER_API_KEY",),),
+}
+
+#: OpenCode provider → env vars forwarded to the agent runtime when set.
+#: Kept as a flat list to distinguish from ``_OPENCODE_AUTH_ALTERNATIVES``;
+#: these names are passed through unconditionally rather than checked for
+#: at least one.
+_OPENCODE_PASSTHROUGH_ENV: dict[str, tuple[str, ...]] = {
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "azure": ("AZURE_RESOURCE_NAME", "AZURE_API_KEY"),
+    "deepseek": ("DEEPSEEK_API_KEY",),
+    "github-copilot": ("GITHUB_TOKEN",),
+    "google": (
+        "GEMINI_API_KEY",
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_API_KEY",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+    ),
+    "groq": ("GROQ_API_KEY",),
+    "huggingface": ("HF_TOKEN",),
+    "llama": ("LLAMA_API_KEY",),
+    "mistral": ("MISTRAL_API_KEY",),
+    "openai": ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+    "opencode": ("OPENCODE_API_KEY",),
+    "xai": ("XAI_API_KEY",),
+    "openrouter": ("OPENROUTER_API_KEY",),
+}
+
+
+class OpenCodeNativeBackend(AgentBackend):
+    """The only OpenCode backend today: look up the provider from
+    ``model_name`` and forward the matching credentials/passthrough env.
+    """
+
+    name = "native"
+
+    def validate(self, ctx: BackendContext) -> None:
+        if not ctx.model_name:
+            raise ValueError(
+                f"Model name is required for {ctx.agent_name} backend {self.name!r}"
+            )
+        provider, _ = split_model_name(ctx.model_name)
+        alternatives = _OPENCODE_AUTH_ALTERNATIVES.get(provider)
+        if alternatives is None:
+            raise ValueError(
+                f"{ctx.agent_name} backend {self.name!r}: unknown provider "
+                f"{provider!r}. If this provider should be supported, add it "
+                f"to _OPENCODE_AUTH_ALTERNATIVES."
+            )
+        require_env(
+            backend_label=f"{ctx.agent_name} backend {self.name!r}",
+            get_env=ctx.get_env,
+            any_of=alternatives,
+        )
+
+    def build_env(self, ctx: BackendContext) -> dict[str, str]:
+        if not ctx.model_name:
+            return {}
+        provider, _ = split_model_name(ctx.model_name)
+        return collect_env(ctx.get_env, _OPENCODE_PASSTHROUGH_ENV.get(provider, ()))
+
+    def runtime_model_name(self, ctx: BackendContext) -> str | None:
+        return ctx.runtime_model_name or ctx.model_name
+
+
 class OpenCode(BaseInstalledAgent):
     """
     The OpenCode agent uses the opencode-ai tool to solve tasks.
@@ -44,6 +141,8 @@ class OpenCode(BaseInstalledAgent):
     """
 
     SUPPORTS_ATIF: bool = True
+    DEFAULT_BACKEND = "native"
+    BACKENDS = backend_registry(OpenCodeNativeBackend())
 
     _OUTPUT_FILENAME = "opencode.txt"
     CLI_FLAGS = [
@@ -382,7 +481,7 @@ class OpenCode(BaseInstalledAgent):
         if self.model_name and "/" in self.model_name:
             provider, model_id = self.model_name.split("/", 1)
             provider_config: dict[str, Any] = {"models": {model_id: {}}}
-            base_url = os.environ.get("OPENAI_BASE_URL")
+            base_url = self._get_env("OPENAI_BASE_URL")
             if base_url and provider == "openai":
                 # opencode reads baseURL from provider.options, not the provider root.
                 # See: https://github.com/anomalyco/opencode config.ts ProviderConfig schema.
@@ -410,63 +509,12 @@ class OpenCode(BaseInstalledAgent):
     ) -> None:
         escaped_instruction = shlex.quote(instruction)
 
-        if not self.model_name or "/" not in self.model_name:
-            raise ValueError("Model name must be in the format provider/model_name")
+        if not self.model_name:
+            raise ValueError("Model name is required")
 
-        provider, _ = self.model_name.split("/", 1)
-
-        env = {}
-        keys = []
-
-        # Get provider environment variables
-        if provider == "amazon-bedrock":
-            keys.extend(["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"])
-        elif provider == "anthropic":
-            keys.append("ANTHROPIC_API_KEY")
-        elif provider == "azure":
-            keys.extend(["AZURE_RESOURCE_NAME", "AZURE_API_KEY"])
-        elif provider == "deepseek":
-            keys.append("DEEPSEEK_API_KEY")
-        elif provider == "github-copilot":
-            keys.append("GITHUB_TOKEN")
-        elif provider == "google":
-            keys.extend(
-                [
-                    "GEMINI_API_KEY",
-                    "GOOGLE_GENERATIVE_AI_API_KEY",
-                    "GOOGLE_APPLICATION_CREDENTIALS",
-                    "GOOGLE_CLOUD_PROJECT",
-                    "GOOGLE_CLOUD_LOCATION",
-                    "GOOGLE_GENAI_USE_VERTEXAI",
-                    "GOOGLE_API_KEY",
-                ]
-            )
-        elif provider == "groq":
-            keys.append("GROQ_API_KEY")
-        elif provider == "huggingface":
-            keys.append("HF_TOKEN")
-        elif provider == "llama":
-            keys.append("LLAMA_API_KEY")
-        elif provider == "mistral":
-            keys.append("MISTRAL_API_KEY")
-        elif provider == "openai":
-            keys.append("OPENAI_API_KEY")
-            keys.append("OPENAI_BASE_URL")
-        elif provider == "opencode":
-            keys.append("OPENCODE_API_KEY")
-        elif provider == "xai":
-            keys.append("XAI_API_KEY")
-        elif provider == "openrouter":
-            keys.append("OPENROUTER_API_KEY")
-        else:
-            raise ValueError(
-                f"Unknown provider {provider}. If you believe this provider "
-                "should be supported, please contact the maintainers."
-            )
-
-        for key in keys:
-            if key in os.environ:
-                env[key] = os.environ[key]
+        backend = self.require_backend_spec()
+        ctx = self.backend_context(self._get_env)
+        env: dict[str, str] = dict(backend.build_env(ctx))
 
         # Enable fake VCS for OpenCode
         env["OPENCODE_FAKE_VCS"] = "git"

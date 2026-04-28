@@ -25,14 +25,18 @@ _F = Any  # Use Any to keep the decorator signature-transparent to type checkers
 
 
 def with_prompt_template(fn: _F) -> _F:
-    """Decorator for ``run()`` that applies prompt-template rendering.
+    """Decorator for ``run()`` that renders the instruction and preflights the
+    backend.
 
-    Usage::
+    Runs, in order:
 
-        @with_prompt_template
-        async def run(self, instruction, environment, context):
-            # instruction is already rendered through the prompt template
-            ...
+    1. Prompt-template rendering of ``instruction``.
+    2. :meth:`BaseAgent.preflight_backend`, using the agent's ``_get_env`` so
+       ``extra_env`` wins over ``os.environ``.
+
+    Placing preflight here means every installed agent gets credential
+    validation right before running, without each ``run()`` having to
+    remember to call it — and construction stays side-effect free.
     """
 
     @functools.wraps(fn)
@@ -40,6 +44,7 @@ def with_prompt_template(fn: _F) -> _F:
         self: BaseInstalledAgent, instruction: str, *args: Any, **kwargs: Any
     ) -> None:
         instruction = self.render_instruction(instruction)
+        self.preflight_backend(self._get_env)
         return await fn(self, instruction, *args, **kwargs)
 
     return wrapper

@@ -77,7 +77,32 @@ class ServiceVolumeConfig(TypedDict):
 class AgentConfig(BaseModel):
     name: str | None = None
     import_path: str | None = None
-    model_name: str | None = None
+    model_name: str | None = Field(
+        default=None,
+        description=(
+            "Pier's canonical model id in provider/model format, for example "
+            "'anthropic/claude-sonnet-4-5'. This identifies what model the trial "
+            "represents, independent of the inference backend used at runtime."
+        ),
+    )
+    backend: str | None = Field(
+        default=None,
+        description=(
+            "Agent-specific inference backend. Each agent declares its own "
+            "supported backends (see the agent's BACKENDS class attribute); "
+            "valid values differ per agent. When unset, the agent's "
+            "DEFAULT_BACKEND is used."
+        ),
+    )
+    runtime_model_name: str | None = Field(
+        default=None,
+        description=(
+            "Advanced override for the exact model string passed to the "
+            "agent runtime. When unset, the backend derives it from "
+            "``model_name`` using backend-specific rules (e.g. the Anthropic "
+            "backend strips the provider prefix, while Respan keeps it)."
+        ),
+    )
     override_timeout_sec: float | None = None
     override_setup_timeout_sec: float | None = None
     max_timeout_sec: float | None = None
