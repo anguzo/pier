@@ -3,7 +3,7 @@ import shlex
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, ClassVar
 
 import yaml
 
@@ -349,14 +349,7 @@ class MiniSweAgent(BaseInstalledAgent):
 
     SUPPORTS_ATIF: bool = True
 
-    CLI_FLAGS = [
-        CliFlag(
-            "cost_limit",
-            cli="--cost-limit",
-            type="str",
-            default="0",
-        ),
-    ]
+    CLI_FLAGS: ClassVar[list[CliFlag]] = []
     _LITELLM_MODEL_COST_MAP_URL = (
         "https://raw.githubusercontent.com/BerriAI/litellm/main/"
         "model_prices_and_context_window.json"
@@ -377,6 +370,7 @@ class MiniSweAgent(BaseInstalledAgent):
 
     def __init__(
         self,
+        cost_limit: str | int | float | None = 0,
         reasoning_effort: str | None = None,
         config_yaml: str | None = None,
         config_file: str | None = None,
@@ -384,6 +378,7 @@ class MiniSweAgent(BaseInstalledAgent):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self._cost_limit = cost_limit
         self._reasoning_effort = reasoning_effort
         self._config_yaml = config_yaml
         if config_file:
@@ -514,6 +509,23 @@ mini-swe-agent --help
         """Path where we write the ATIF-formatted trajectory."""
         return EnvironmentPaths.agent_dir / "trajectory.json"
 
+    def _build_config_flags(self, *, custom_config_path: str | None = None) -> str:
+        config_flags = "-c mini.yaml "
+
+        if self._cost_limit is not None:
+            config_flags += f"-c agent.cost_limit={shlex.quote(str(self._cost_limit))} "
+
+        if custom_config_path:
+            config_flags += f"-c {custom_config_path} "
+
+        if self._reasoning_effort:
+            config_flags += (
+                f"-c model.model_kwargs.reasoning_effort="
+                f"{shlex.quote(self._reasoning_effort)} "
+            )
+
+        return config_flags
+
     def populate_context_post_run(self, context: AgentContext) -> None:
         # Read the mini-swe-agent trajectory
         mini_trajectory_path = self.logs_dir / "mini-swe-agent.trajectory.json"
@@ -624,28 +636,21 @@ mini-swe-agent --help
 
         cli_flags = self.build_cli_flags()
         extra_flags = (cli_flags + " ") if cli_flags else ""
-
-        # mini-swe-agent v2 does not load its default config when any -c flag
-        # is passed, so include mini.yaml before Pier-provided overrides.
-        config_flags = ""
-        if self._config_yaml or self._reasoning_effort:
-            config_flags = "-c mini.yaml "
+        custom_config_path = None
 
         # Write custom config into the container if provided
         if self._config_yaml:
-            config_path = "/tmp/mswea-config/custom.yaml"
+            custom_config_path = "/tmp/mswea-config/custom.yaml"
             heredoc_marker = f"MSWEA_CONFIG_EOF_{uuid.uuid4().hex[:8]}"
             write_config_cmd = (
                 f"mkdir -p /tmp/mswea-config\n"
-                f"cat > '{config_path}' << '{heredoc_marker}'\n"
+                f"cat > '{custom_config_path}' << '{heredoc_marker}'\n"
                 f"{self._config_yaml}\n"
                 f"{heredoc_marker}\n"
             )
             await self.exec_as_agent(environment, command=write_config_cmd, env=env)
-            config_flags += f"-c {config_path} "
 
-        if self._reasoning_effort:
-            config_flags += f"-c model.model_kwargs.reasoning_effort={shlex.quote(self._reasoning_effort)} "
+        config_flags = self._build_config_flags(custom_config_path=custom_config_path)
 
         await self.exec_as_agent(
             environment,
