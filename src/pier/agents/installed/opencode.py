@@ -296,7 +296,7 @@ class OpenCode(BaseInstalledAgent):
                 "step_id": step_id,
                 "timestamp": timestamp,
                 "source": "agent",
-                "message": message_text or "(tool use)",
+                "message": message_text,
                 "model_name": self.model_name,
                 "llm_call_count": 1,
             }

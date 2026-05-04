@@ -463,17 +463,13 @@ class Codex(BaseInstalledAgent):
                 extra = extra or {}
                 extra["codex_turn_id"] = codex_turn_id
 
-            message = event.get("message")
-            if not message:
-                summary_parts = [part for part in [tool_name, call_id] if part]
-                summary = " ".join(summary_parts) if summary_parts else "Tool call"
-                message = f"Executed {summary}"
+            message_text = event.get("message") or ""
 
             return Step(
                 step_id=step_id,
                 timestamp=timestamp,
                 source="agent",
-                message=message,
+                message=message_text,
                 tool_calls=[tool_call],
                 observation=observation,
                 model_name=self.model_name if self.model_name else None,
