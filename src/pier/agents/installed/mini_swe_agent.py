@@ -139,6 +139,50 @@ def _parse_tool_calls(
     return tool_calls if tool_calls else None, reasoning
 
 
+def _usage_from_message(message: dict[str, Any]) -> dict[str, Any]:
+    extra = message.get("extra") or {}
+    response_data = extra.get("response") or {}
+    usage = response_data.get("usage") or message.get("usage") or {}
+    return usage if isinstance(usage, dict) else {}
+
+
+def _response_output_text_and_tool_calls(
+    message: dict[str, Any], step_id: int
+) -> tuple[str, list[ToolCall] | None]:
+    text_parts: list[str] = []
+    tool_calls: list[ToolCall] = []
+
+    for item in message.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "message":
+            for part in item.get("content") or []:
+                if isinstance(part, dict) and part.get("text"):
+                    text_parts.append(str(part["text"]))
+        elif item.get("type") == "function_call":
+            raw_args = item.get("arguments") or "{}"
+            if isinstance(raw_args, str):
+                try:
+                    arguments = json.loads(raw_args)
+                except (json.JSONDecodeError, TypeError):
+                    arguments = {"command": raw_args}
+            elif isinstance(raw_args, dict):
+                arguments = raw_args
+            else:
+                arguments = {"command": str(raw_args)}
+            tool_calls.append(
+                ToolCall(
+                    tool_call_id=item.get("call_id")
+                    or item.get("id")
+                    or f"call_{step_id}_{len(tool_calls) + 1}",
+                    function_name=item.get("name") or "bash",
+                    arguments=arguments,
+                )
+            )
+
+    return "\n".join(text_parts), tool_calls or None
+
+
 def convert_mini_swe_agent_to_atif(
     mini_swe_agent_trajectory: dict[str, Any],
     session_id: str,
@@ -182,26 +226,39 @@ def convert_mini_swe_agent_to_atif(
 
     # First pass: count total completion tokens for cost apportioning
     for message in messages:
-        extra = message.get("extra") or {}
-        response_data = extra.get("response") or {}
-        usage = response_data.get("usage") or {}
-        total_completion_tokens += usage.get("completion_tokens") or 0
+        usage = _usage_from_message(message)
+        total_completion_tokens += (
+            usage.get("completion_tokens") or usage.get("output_tokens") or 0
+        )
 
     # Process messages
     for i, message in enumerate(messages):
         role = message.get("role")
         content = _normalize_content(message.get("content"))
-        extra = message.get("extra") or {}
 
         # Extract token usage
-        response_data = extra.get("response") or {}
-        usage = response_data.get("usage") or {}
-
-        prompt_tokens = usage.get("prompt_tokens") or 0
-        completion_tokens = usage.get("completion_tokens") or 0
-        prompt_tokens_details = usage.get("prompt_tokens_details") or {}
-        completion_tokens_details = usage.get("completion_tokens_details") or {}
-        cached_tokens = prompt_tokens_details.get("cached_tokens") or 0
+        usage = _usage_from_message(message)
+        prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+        completion_tokens = (
+            usage.get("completion_tokens") or usage.get("output_tokens") or 0
+        )
+        prompt_tokens_details = (
+            usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+        )
+        if not isinstance(prompt_tokens_details, dict):
+            prompt_tokens_details = {}
+        completion_tokens_details = (
+            usage.get("completion_tokens_details")
+            or usage.get("output_tokens_details")
+            or {}
+        )
+        if not isinstance(completion_tokens_details, dict):
+            completion_tokens_details = {}
+        cached_tokens = (
+            prompt_tokens_details.get("cached_tokens")
+            or usage.get("cache_read_input_tokens")
+            or 0
+        )
         reasoning_tokens = completion_tokens_details.get("reasoning_tokens") or 0
 
         total_prompt_tokens += prompt_tokens
@@ -263,6 +320,43 @@ def convert_mini_swe_agent_to_atif(
                 )
             )
             step_id += 1
+
+        elif message.get("object") == "response":
+            response_content, tool_calls = _response_output_text_and_tool_calls(
+                message, step_id
+            )
+            reasoning = response_content if response_content else None
+
+            metrics = _build_step_metrics(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cached_tokens=cached_tokens,
+                prompt_tokens_details=prompt_tokens_details,
+                completion_tokens_details=completion_tokens_details,
+                total_cost_usd=total_cost_usd,
+                total_completion_tokens=total_completion_tokens,
+            )
+
+            steps.append(
+                Step(
+                    step_id=step_id,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    source="agent",
+                    model_name=model_name,
+                    message=response_content,
+                    reasoning_content=reasoning,
+                    tool_calls=tool_calls,
+                    metrics=metrics,
+                    llm_call_count=1,
+                )
+            )
+            step_id += 1
+
+        elif message.get("type") == "function_call_output":
+            output = message.get("output")
+            if not isinstance(output, str):
+                output = _normalize_content(output)
+            _add_observation_to_last_agent_step(steps, output, _logger, i)
 
     # Build final metrics
     final_extra: dict[str, Any] = {}
@@ -372,6 +466,7 @@ class MiniSweAgent(BaseInstalledAgent):
         self,
         cost_limit: str | int | float | None = 0,
         reasoning_effort: str | None = None,
+        model_class: str | None = "auto",
         config_yaml: str | None = None,
         config_file: str | None = None,
         *args,
@@ -380,6 +475,7 @@ class MiniSweAgent(BaseInstalledAgent):
         super().__init__(*args, **kwargs)
         self._cost_limit = cost_limit
         self._reasoning_effort = reasoning_effort
+        self._model_class = model_class
         self._config_yaml = config_yaml
         if config_file:
             self._config_yaml = Path(config_file).read_text()
@@ -509,6 +605,26 @@ mini-swe-agent --help
         """Path where we write the ATIF-formatted trajectory."""
         return EnvironmentPaths.agent_dir / "trajectory.json"
 
+    @property
+    def _model_class_override(self) -> str | None:
+        if self._model_class != "auto":
+            return self._model_class
+        if self.model_name and self.model_name.startswith("openai/"):
+            return "litellm_response"
+        if self.model_name and self.model_name.startswith("openrouter/"):
+            return "openrouter"
+        return None
+
+    @property
+    def _run_model_name(self) -> str:
+        if (
+            self._model_class_override in {"openrouter", "openrouter_response"}
+            and self.model_name
+            and self.model_name.startswith("openrouter/")
+        ):
+            return self.model_name.removeprefix("openrouter/")
+        return self.model_name or ""
+
     def _build_config_flags(self, *, custom_config_path: str | None = None) -> str:
         config_flags = "-c mini.yaml "
 
@@ -517,6 +633,9 @@ mini-swe-agent --help
 
         if custom_config_path:
             config_flags += f"-c {custom_config_path} "
+
+        if model_class := self._model_class_override:
+            config_flags += f"-c model.model_class={shlex.quote(model_class)} "
 
         if self._reasoning_effort:
             config_flags += (
@@ -535,35 +654,6 @@ mini-swe-agent --help
                 f"Mini-swe-agent trajectory file {mini_trajectory_path} does not exist"
             )
             return
-
-        try:
-            mini_trajectory = json.loads(mini_trajectory_path.read_text())
-        except Exception as e:
-            self.logger.debug(f"Failed to load mini-swe-agent trajectory: {e}")
-            return
-
-        # Extract token usage from mini-swe-agent format
-        n_input_tokens = 0
-        n_output_tokens = 0
-        n_cache_tokens = 0
-        total_cost = ((mini_trajectory.get("info") or {}).get("model_stats") or {}).get(
-            "instance_cost"
-        ) or 0
-        for message in mini_trajectory.get("messages") or []:
-            usage = ((message.get("extra") or {}).get("response") or {}).get(
-                "usage"
-            ) or {}
-
-            prompt_tokens_details = usage.get("prompt_tokens_details") or {}
-            n_cache_tokens += prompt_tokens_details.get("cached_tokens") or 0
-
-            n_input_tokens += usage.get("prompt_tokens") or 0
-            n_output_tokens += usage.get("completion_tokens") or 0
-
-        context.n_input_tokens = n_input_tokens
-        context.n_output_tokens = n_output_tokens
-        context.n_cache_tokens = n_cache_tokens
-        context.cost_usd = total_cost
 
         # Convert mini-swe-agent trajectory to ATIF format
         atif_trajectory_path = self.logs_dir / "trajectory.json"
@@ -598,7 +688,8 @@ mini-swe-agent --help
 
         escaped_instruction = shlex.quote(augmented_instruction)
 
-        if not self.model_name or "/" not in self.model_name:
+        run_model_name = self._run_model_name
+        if not run_model_name or "/" not in run_model_name:
             raise ValueError("Model name must be in the format provider/model_name")
 
         env = self.build_process_env(
@@ -656,7 +747,7 @@ mini-swe-agent --help
             environment,
             command=(
                 '. "$HOME/.local/bin/env"; '
-                f"mini-swe-agent --yolo --model={self.model_name} --task={escaped_instruction} "
+                f"mini-swe-agent --yolo --model={run_model_name} --task={escaped_instruction} "
                 f"--output={self._mini_swe_agent_trajectory_path} {extra_flags}"
                 f"{config_flags}"
                 f"--exit-immediately 2>&1 </dev/null | tee /logs/agent/mini-swe-agent.txt"

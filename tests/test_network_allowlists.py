@@ -124,3 +124,46 @@ def test_mini_swe_cost_limit_zero_is_config_override(tmp_path: Path):
     assert "-c mini.yaml" in config_flags
     assert "-c agent.cost_limit=0" in config_flags
     assert "--cost-limit" not in agent.build_cli_flags()
+
+
+def test_mini_swe_openai_uses_responses_model_class(tmp_path: Path):
+    agent = MiniSweAgent(
+        logs_dir=tmp_path,
+        model_name="openai/gpt-5.5",
+        reasoning_effort="xhigh",
+    )
+
+    config_flags = agent._build_config_flags()
+
+    assert "-c model.model_class=litellm_response" in config_flags
+    assert "-c model.model_kwargs.reasoning_effort=xhigh" in config_flags
+
+
+def test_mini_swe_model_class_can_be_overridden(tmp_path: Path):
+    agent = MiniSweAgent(
+        logs_dir=tmp_path,
+        model_name="openai/gpt-5.5",
+        model_class="litellm",
+    )
+
+    assert "-c model.model_class=litellm " in agent._build_config_flags()
+
+
+def test_mini_swe_model_class_can_be_disabled(tmp_path: Path):
+    agent = MiniSweAgent(
+        logs_dir=tmp_path,
+        model_name="openai/gpt-5.5",
+        model_class=None,
+    )
+
+    assert "model.model_class" not in agent._build_config_flags()
+
+
+def test_mini_swe_openrouter_uses_native_model_class(tmp_path: Path):
+    agent = MiniSweAgent(
+        logs_dir=tmp_path,
+        model_name="openrouter/minimax/minimax-m2.7",
+    )
+
+    assert agent._run_model_name == "minimax/minimax-m2.7"
+    assert "-c model.model_class=openrouter" in agent._build_config_flags()
