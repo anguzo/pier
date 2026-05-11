@@ -204,7 +204,8 @@ class Job:
             trial_paths = TrialPaths(trial_dir)
 
             if not trial_paths.result_path.exists():
-                shutil.rmtree(trial_paths.trial_dir)
+                if self._is_incomplete_trial_dir(trial_paths):
+                    shutil.rmtree(trial_paths.trial_dir)
             else:
                 self._existing_trial_configs.append(
                     TrialConfig.model_validate_json(trial_paths.config_path.read_text())
@@ -232,6 +233,22 @@ class Job:
             self._previous_trial_results[trial_result.trial_name] = trial_result
 
         self._existing_stats = JobStats.from_trial_results(self._existing_trial_results)
+
+    @staticmethod
+    def _is_incomplete_trial_dir(trial_paths: TrialPaths) -> bool:
+        """Return whether a result-less directory is a trial scratch dir.
+
+        Job directories can also contain metadata directories such as
+        ``.critiques``. Those do not have a root-level ``result.json`` and must
+        not be treated as failed trial starts during resume cleanup.
+        """
+        return (
+            trial_paths.config_path.exists()
+            or trial_paths.log_path.exists()
+            or trial_paths.agent_dir.exists()
+            or trial_paths.verifier_dir.exists()
+            or trial_paths.artifacts_dir.exists()
+        )
 
     def _init_progress_tracking(self) -> None:
         self._running_trial_ids: set[str] = set()
