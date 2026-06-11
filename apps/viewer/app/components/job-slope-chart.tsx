@@ -24,7 +24,7 @@ import {
   sortByFamilyRank,
 } from "~/lib/model-family";
 import type { JobHeatmapCell, JobHeatmapData } from "~/lib/types";
-import { cn } from "~/lib/utils";
+import { cn, splitEffortLabel } from "~/lib/utils";
 
 interface ModelSeries {
   rowKey: string;
@@ -142,14 +142,19 @@ function buildChart(
 
   const seriesKeyForRow = (row: (typeof data.rows)[number]): string => {
     const modelKey = modelKeyForRow(row.model_name);
+    // Effort is part of the series identity so different effort levels of the
+    // same model stay as separate lines instead of being averaged together.
+    const effortKey = row.reasoning_effort ?? "";
     if (connectionMode === "model") {
-      return `model::${modelKey}`;
+      return `model::${modelKey}::${effortKey}`;
     }
-    return `config::${row.agent_name ?? ""}::${modelKey}`;
+    return `config::${row.agent_name ?? ""}::${modelKey}::${effortKey}`;
   };
 
   const seriesLabelForRow = (row: (typeof data.rows)[number]): string => {
-    const modelLabel = modelKeyForRow(row.model_name);
+    const modelLabel = row.reasoning_effort
+      ? `${modelKeyForRow(row.model_name)} [${row.reasoning_effort}]`
+      : modelKeyForRow(row.model_name);
     if (connectionMode === "model") return modelLabel;
     return (
       [row.agent_name, modelLabel].filter(Boolean).join(" / ") || "(unknown)"
@@ -915,7 +920,19 @@ export function JobSlopeChart({
                   fontWeight={isHovered ? 600 : 400}
                   fill={color}
                 >
-                  <tspan>{entry.series.label}</tspan>
+                  {(() => {
+                    const { base, effort } = splitEffortLabel(entry.series.label);
+                    return (
+                      <>
+                        <tspan>{base}</tspan>
+                        {effort && (
+                          <tspan dx={4} opacity={0.55}>
+                            {effort}
+                          </tspan>
+                        )}
+                      </>
+                    );
+                  })()}
                   <tspan
                     dx={6}
                     fontFamily="var(--font-mono, ui-monospace)"
@@ -968,7 +985,19 @@ export function JobSlopeChart({
                   >
                     {formatRawScore(entry.rawValue, usePercentScale)}
                   </tspan>
-                  <tspan dx={6}>{entry.series.label}</tspan>
+                  {(() => {
+                    const { base, effort } = splitEffortLabel(entry.series.label);
+                    return (
+                      <>
+                        <tspan dx={6}>{base}</tspan>
+                        {effort && (
+                          <tspan dx={4} opacity={0.55}>
+                            {effort}
+                          </tspan>
+                        )}
+                      </>
+                    );
+                  })()}
                 </text>
               </g>
             );
@@ -1103,7 +1132,19 @@ function Legend({
                     className="inline-block h-[3px] w-4 rounded-full"
                     style={{ background: color }}
                   />
-                  <span className="font-mono">{s.label}</span>
+                  <span className="font-mono">
+                    {(() => {
+                      const { base, effort } = splitEffortLabel(s.label);
+                      return (
+                        <>
+                          {base}
+                          {effort && (
+                            <span className="opacity-[0.55]"> {effort}</span>
+                          )}
+                        </>
+                      );
+                    })()}
+                  </span>
                 </button>
               );
             })}

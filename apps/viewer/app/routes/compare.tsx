@@ -274,6 +274,15 @@ export default function ComparePage() {
   const setHeatmapTrialsFilter = (value: JobHeatmapTrialsFilter) =>
     setHeatmapTrialsRaw(value === "all" ? null : value);
 
+  const [efficiencyTrialsRaw, setEfficiencyTrialsRaw] = useQueryState(
+    "eff_trials",
+    parseAsString.withDefault("non_errored")
+  );
+  const efficiencyTrialsFilter: JobHeatmapTrialsFilter =
+    efficiencyTrialsRaw === "all" || efficiencyTrialsRaw === "successful"
+      ? efficiencyTrialsRaw
+      : "non_errored";
+
   const {
     data: heatmapData,
     isLoading: heatmapLoading,
@@ -313,9 +322,27 @@ export default function ComparePage() {
       }),
     enabled:
       jobNames.length >= 1 &&
-      (activeTab === "cross-bench" ||
-        activeTab === "scatter" ||
-        activeTab === "efficiency"),
+      (activeTab === "cross-bench" || activeTab === "scatter"),
+    placeholderData: keepPreviousData,
+  });
+
+  // Efficiency tab uses its own query so the all-vs-exclude-errors toggle can
+  // refetch independently of the slope/scatter views.
+  const {
+    data: efficiencyData,
+    isLoading: efficiencyLoading,
+    error: efficiencyError,
+    isPlaceholderData: efficiencyIsPlaceholder,
+  } = useQuery({
+    queryKey: ["comparison-efficiency", jobNames, efficiencyTrialsFilter],
+    queryFn: () =>
+      fetchComparisonHeatmap(jobNames, {
+        rowBy: "config",
+        columnBy: "dataset",
+        trialsFilter:
+          efficiencyTrialsFilter === "all" ? undefined : efficiencyTrialsFilter,
+      }),
+    enabled: jobNames.length >= 1 && activeTab === "efficiency",
     placeholderData: keepPreviousData,
   });
 
@@ -330,8 +357,8 @@ export default function ComparePage() {
   );
 
   const filterOptions = useMemo(
-    () => buildFilterOptions(heatmapData, slopeData),
-    [heatmapData, slopeData]
+    () => buildFilterOptions(heatmapData, slopeData, efficiencyData),
+    [heatmapData, slopeData, efficiencyData]
   );
 
   const filteredHeatmapData = useMemo(
@@ -349,6 +376,10 @@ export default function ComparePage() {
   const filteredSlopeData = useMemo(
     () => applyCompareFilters(slopeData, filters, false),
     [slopeData, filters]
+  );
+  const filteredEfficiencyData = useMemo(
+    () => applyCompareFilters(efficiencyData, filters, false),
+    [efficiencyData, filters]
   );
 
   const activeFilterCount =
@@ -522,13 +553,17 @@ export default function ComparePage() {
             )}
           </TabsContent>
           <TabsContent value="efficiency" className="mt-0 p-4">
-            {slopeError ? (
-              <CompareError message={`Error loading efficiency comparison: ${slopeError.message}`} />
+            {efficiencyError ? (
+              <CompareError message={`Error loading efficiency comparison: ${efficiencyError.message}`} />
             ) : (
               <JobEfficiencyChart
-                data={filteredSlopeData}
-                isLoading={slopeLoading}
-                isFetching={slopeIsPlaceholder}
+                data={filteredEfficiencyData}
+                isLoading={efficiencyLoading}
+                isFetching={efficiencyIsPlaceholder}
+                trialsFilter={efficiencyTrialsFilter}
+                onTrialsFilterChange={(value) =>
+                  setEfficiencyTrialsRaw(value === "non_errored" ? null : value)
+                }
               />
             )}
           </TabsContent>

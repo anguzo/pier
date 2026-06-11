@@ -1328,6 +1328,14 @@ export default function Job() {
       : "all";
   const setHeatmapTrialsFilter = (value: JobHeatmapTrialsFilter) =>
     setHeatmapTrialsRaw(value === "all" ? null : value);
+  const [efficiencyTrialsRaw, setEfficiencyTrialsRaw] = useQueryState(
+    "eff_trials",
+    parseAsString.withDefault("non_errored")
+  );
+  const efficiencyTrialsFilter: JobHeatmapTrialsFilter =
+    efficiencyTrialsRaw === "all" || efficiencyTrialsRaw === "successful"
+      ? efficiencyTrialsRaw
+      : "non_errored";
   const [hiddenColumns, setHiddenColumns] = useQueryState(
     "hide",
     parseAsArrayOf(parseAsString).withDefault([])
@@ -1598,9 +1606,43 @@ export default function Job() {
       }),
     enabled:
       !!jobName &&
-      (activeTab === "cross-bench" ||
-        activeTab === "scatter" ||
-        activeTab === "efficiency"),
+      (activeTab === "cross-bench" || activeTab === "scatter"),
+    refetchInterval: job?.finished_at ? false : 5000,
+    placeholderData: keepPreviousData,
+  });
+
+  // Efficiency tab uses its own query so the all-vs-exclude-errors toggle can
+  // refetch independently of the slope/scatter views.
+  const {
+    data: efficiencyData,
+    isLoading: efficiencyLoading,
+    isPlaceholderData: efficiencyIsPlaceholder,
+  } = useQuery({
+    queryKey: [
+      "job-efficiency",
+      jobName,
+      debouncedSearch,
+      agentFilter,
+      providerFilter,
+      modelFilter,
+      sourceFilter,
+      taskFilter,
+      efficiencyTrialsFilter,
+    ],
+    queryFn: () =>
+      fetchJobHeatmap(jobName!, {
+        search: debouncedSearch || undefined,
+        agents: agentFilter.length > 0 ? agentFilter : undefined,
+        providers: providerFilter.length > 0 ? providerFilter : undefined,
+        models: modelFilter.length > 0 ? modelFilter : undefined,
+        sources: sourceFilter.length > 0 ? sourceFilter : undefined,
+        tasks: taskFilter.length > 0 ? taskFilter : undefined,
+        rowBy: "config",
+        columnBy: "dataset",
+        trialsFilter:
+          efficiencyTrialsFilter === "all" ? undefined : efficiencyTrialsFilter,
+      }),
+    enabled: !!jobName && activeTab === "efficiency",
     refetchInterval: job?.finished_at ? false : 5000,
     placeholderData: keepPreviousData,
   });
@@ -2181,9 +2223,13 @@ export default function Job() {
             />
           </div>
           <JobEfficiencyChart
-            data={slopeData}
-            isLoading={slopeLoading}
-            isFetching={slopeIsPlaceholder}
+            data={efficiencyData}
+            isLoading={efficiencyLoading}
+            isFetching={efficiencyIsPlaceholder}
+            trialsFilter={efficiencyTrialsFilter}
+            onTrialsFilterChange={(value) =>
+              setEfficiencyTrialsRaw(value === "non_errored" ? null : value)
+            }
           />
         </TabsContent>
         <TabsContent value="scaling">
