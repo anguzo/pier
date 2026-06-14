@@ -741,6 +741,7 @@ class Trial:
                     target_dir=self._trial_paths.agent_dir,
                 )
                 self._maybe_populate_agent_context(step_result.agent_result)
+                await self._run_pre_artifacts_script()
                 await self._maybe_upload_agent_logs()
 
                 # Collect artifacts from the agent environment before
@@ -809,6 +810,38 @@ class Trial:
         # during the run; per-step content has been relocated under steps/, so
         # rmdir any that are now empty (safe: rmdir raises on non-empty).
         self._trial_paths.cleanup_empty_mount_dirs()
+
+    async def _run_pre_artifacts_script(self) -> None:
+        """Run the task's optional ``pre_artifacts.sh`` in the agent environment.
+
+        Runs after the agent finishes and immediately before artifact
+        collection so the task can materialize artifacts from the agent's work
+        (e.g. capture the change set as ``/logs/artifacts/model.patch`` for a
+        separate verifier). Failures are logged, not fatal: a missing or failed
+        capture simply yields no artifact, which downstream grading treats as
+        an empty submission.
+        """
+        script = self._task.paths.pre_artifacts_path
+        if not script.exists():
+            return
+        target = "/tmp/.pier-pre-artifacts.sh"
+        try:
+            await self._environment.upload_file(
+                source_path=script, target_path=target
+            )
+            result = await self._environment.exec(
+                command=f"bash {target}",
+                timeout_sec=300,
+            )
+            if result.return_code != 0:
+                self._logger.warning(
+                    f"pre_artifacts.sh exited {result.return_code}"
+                )
+        except Exception:
+            self._logger.warning(
+                "pre_artifacts.sh failed to run; continuing without it",
+                exc_info=True,
+            )
 
     async def _maybe_upload_agent_logs(self) -> None:
         """Upload locally-generated agent logs back to the environment.
@@ -914,6 +947,7 @@ class Trial:
             # so a separate verifier environment can receive them. Multi-step
             # trials collect artifacts per-step inside _run_steps.
             if not self._task.has_steps:
+                await self._run_pre_artifacts_script()
                 await self._maybe_upload_agent_logs()
                 await self._collect_artifacts()
 
