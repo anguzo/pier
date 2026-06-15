@@ -4,6 +4,7 @@ from pier.agents.installed.codex import Codex
 from pier.agents.installed.gemini_cli import GeminiCli
 from pier.agents.installed.mini_swe_agent import MiniSweAgent
 from pier.agents.installed.opencode import OpenCode
+from pier.agents.installed.pi import Pi
 
 
 def domains(agent) -> set[str]:
@@ -101,6 +102,16 @@ model:
   model_kwargs:
     api_base: https://gateway.example.com/v1
 """,
+    )
+
+    assert {"api.openai.com", "gateway.example.com"} <= domains(agent)
+
+
+def test_pi_reports_openai_base_url(tmp_path: Path):
+    agent = Pi(
+        logs_dir=tmp_path,
+        model_name="openai/gpt-5.4-mini",
+        extra_env={"OPENAI_BASE_URL": "https://gateway.example.com/v1"},
     )
 
     assert {"api.openai.com", "gateway.example.com"} <= domains(agent)
